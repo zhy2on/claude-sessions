@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""Browse, delete, copy and move Claude Code sessions of a project.
+
+usage: claude-sessions [PROJECT_PATH]   (default: current directory)
+
+keys: up/down (or k/j) navigate, d delete, c copy, m move, q/Esc quit
+Deleted (and moved-away) sessions go to the OS trash: ~/.Trash on macOS,
+~/.local/share/Trash on Linux (freedesktop.org trash spec).
+"""
+
+import curses
+import json
+import locale
+import os
+import re
+import shutil
+import sys
+import time
+import unicodedata
+import urllib.parse
+
+CLAUDE_DIR = os.path.expanduser("~/.claude")
+IS_MACOS = sys.platform == "darwin"
+
+if IS_MACOS:
+    TRASH_DIR = os.path.expanduser("~/.Trash")
+else:
+    # freedesktop.org Trash spec: files go in <trash>/files, with
+    # matching metadata in <trash>/info so desktop file managers see them.
+    xdg_data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    TRASH_DIR = os.path.join(xdg_data_home, "Trash")
+
+
+def project_dir_for(path):
+    path = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+    return os.path.join(CLAUDE_DIR, "projects", re.sub(r"[^A-Za-z0-9]", "-", path))
+
+
+def running_session_ids():
+    ids = set()
+    sess_dir = os.path.join(CLAUDE_DIR, "sessions")
+    if not os.path.isdir(sess_dir):
+        return ids
+    for name in os.listdir(sess_dir):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(sess_dir, name)) as f:
+                info = json.load(f)
+            os.kill(int(info["pid"]), 0)
+        except (OSError, ValueError, KeyError):
+            continue
+        ids.add(info.get("sessionId"))
+    return ids
+
+
+def first_user_text(rec):
+    content = rec.get("message", {}).get("content")
+    if isinstance(content, str):
+        texts = [content]
+    elif isinstance(content, list):
+        texts = [c.get("text", "") for c in content
+                 if isinstance(c, dict) and c.get("type") == "text"]
+    else:
+        return None
+    for t in texts:
+        t = t.strip()
+        if t and not t.startswith("<"):
+            return t
+    return None
+
+
+def read_title(path):
+    custom = ai = first = None
+    with open(path, "rb") as f:
+        for line in f:
+            is_custom = b'"custom-title"' in line
+            is_ai = b'"ai-title"' in line
+            is_user = first is None and b'"type":"user"' in line
+            if not (is_custom or is_ai or is_user):
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            kind = rec.get("type")
+            if kind == "custom-title":
+                custom = rec.get("customTitle") or custom
+            elif kind == "ai-title":
+                ai = rec.get("aiTitle") or ai
+            elif kind == "user" and first is None:
+                first = first_user_text(rec)
+    title = custom or ai or first or "(no title)"
+    return " ".join(title.split())
+
+
+def load_sessions(proj_dir):
+    running = running_session_ids()
+    sessions = []
+    for name in os.listdir(proj_dir):
+        if not name.endswith(".jsonl"):
+            continue
+        path = os.path.join(proj_dir, name)
+        sid = name[:-len(".jsonl")]
+        st = os.stat(path)
+        sessions.append({
+            "id": sid,
+            "path": path,
+            "mtime": st.st_mtime,
+            "size": st.st_size,
+            "title": read_title(path),
+            "running": sid in running,
+        })
+    sessions.sort(key=lambda s: s["mtime"], reverse=True)
+    return sessions
+
+
+def _trash_files_dir():
+    if IS_MACOS:
+        os.makedirs(TRASH_DIR, exist_ok=True)
+        return TRASH_DIR
+    files_dir = os.path.join(TRASH_DIR, "files")
+    os.makedirs(files_dir, exist_ok=True)
+    os.makedirs(os.path.join(TRASH_DIR, "info"), exist_ok=True)
+    return files_dir
+
+
+def _write_trashinfo(original_path, trashed_name):
+    # See https://specifications.freedesktop.org/trash-spec/latest/
+    info_path = os.path.join(TRASH_DIR, "info", trashed_name + ".trashinfo")
+    with open(info_path, "w") as f:
+        f.write(
+            "[Trash Info]\n"
+            "Path=%s\n"
+            "DeletionDate=%s\n"
+            % (urllib.parse.quote(os.path.abspath(original_path)),
+               time.strftime("%Y-%m-%dT%H:%M:%S"))
+        )
+
+
+def move_to_trash(path):
+    files_dir = _trash_files_dir()
+    base = os.path.basename(path)
+    dest = os.path.join(files_dir, base)
+    if os.path.exists(dest):
+        base = "%s %s" % (base, time.strftime("%H.%M.%S"))
+        dest = os.path.join(files_dir, base)
+    shutil.move(path, dest)
+    if not IS_MACOS:
+        _write_trashinfo(path, base)
+
+
+def delete_session(s):
+    move_to_trash(s["path"])
+    side_dir = os.path.join(os.path.dirname(s["path"]), s["id"])
+    if os.path.isdir(side_dir):
+        move_to_trash(side_dir)
+
+
+def copy_or_move_session(s, dest_path, move):
+    """Copy session s to the Claude project folder for dest_path.
+    If move is True, the original is afterwards moved to ~/.Trash.
+    Raises OSError if a session with the same id already exists there.
+    """
+    dest_dir = project_dir_for(dest_path)
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_file = os.path.join(dest_dir, "%s.jsonl" % s["id"])
+    if os.path.exists(dest_file):
+        raise OSError("a session with this id already exists at destination")
+
+    side_dir = os.path.join(os.path.dirname(s["path"]), s["id"])
+    dest_side_dir = os.path.join(dest_dir, s["id"])
+    if os.path.isdir(side_dir) and os.path.exists(dest_side_dir):
+        raise OSError("a session with this id already exists at destination")
+
+    shutil.copy2(s["path"], dest_file)
+    if os.path.isdir(side_dir):
+        shutil.copytree(side_dir, dest_side_dir)
+
+    if move:
+        delete_session(s)
+
+
+def human_size(n):
+    for unit in ("B", "K", "M", "G"):
+        if n < 1024 or unit == "G":
+            return "%.0f%s" % (n, unit) if unit == "B" else "%.1f%s" % (n, unit)
+        n /= 1024.0
+
+
+def cell_width(ch):
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def fit(text, width):
+    out, used = [], 0
+    for ch in text:
+        w = cell_width(ch)
+        if used + w > width:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + " " * max(0, width - used)
+
+
+def put(win, y, text, attr=0):
+    h, w = win.getmaxyx()
+    if y >= h:
+        return
+    try:
+        win.addstr(y, 0, fit(text, w - 1), attr)
+    except curses.error:
+        pass
+
+
+def confirm_dialog(stdscr, title, warn):
+    h, w = stdscr.getmaxyx()
+    dw = min(w - 2, 60)
+    dh = 7
+    win = curses.newwin(dh, dw, max(0, (h - dh) // 2), max(0, (w - dw) // 2))
+    win.keypad(True)
+    inner = dw - 4
+    choice = 1  # 0: Yes, 1: No
+
+    while True:
+        win.erase()
+        win.box()
+        try:
+            win.addstr(1, 2, fit("Delete this session?", inner), warn)
+            win.addstr(2, 2, fit(title, inner))
+        except curses.error:
+            pass
+        yes, no = "[ Yes ]", "[ No ]"
+        bx = (dw - len(yes) - len(no) - 4) // 2
+        win.addstr(4, bx, yes, curses.A_REVERSE if choice == 0 else 0)
+        win.addstr(4, bx + len(yes) + 4, no, curses.A_REVERSE if choice == 1 else 0)
+        win.refresh()
+
+        key = win.getch()
+        if key in (curses.KEY_LEFT, curses.KEY_RIGHT, 9, ord("h"), ord("l")):
+            choice = 1 - choice
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return choice == 0
+        elif key in (ord("y"), ord("Y")):
+            return True
+        elif key in (ord("n"), ord("N"), 27):
+            return False
+
+
+def text_prompt(stdscr, title):
+    h, w = stdscr.getmaxyx()
+    dw = min(w - 2, 70)
+    dh = 5
+    win = curses.newwin(dh, dw, max(0, (h - dh) // 2), max(0, (w - dw) // 2))
+    win.keypad(True)
+    inner = dw - 4
+    text = ""
+
+    curses.curs_set(1)
+    try:
+        while True:
+            win.erase()
+            win.box()
+            try:
+                win.addstr(1, 2, fit(title, inner))
+                win.addstr(2, 2, fit(text, inner))
+                win.addstr(3, 2, fit("Enter to confirm, Esc to cancel", inner))
+                win.move(2, 2 + min(len(text), inner))
+            except curses.error:
+                pass
+            win.refresh()
+
+            key = win.getch()
+            if key in (curses.KEY_ENTER, 10, 13):
+                return text.strip() or None
+            elif key == 27:
+                return None
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                text = text[:-1]
+            elif 32 <= key < 127:
+                text += chr(key)
+    finally:
+        curses.curs_set(0)
+
+
+def tui(stdscr, proj_path, proj_dir):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_YELLOW, -1)
+    curses.init_pair(2, curses.COLOR_RED, -1)
+    dim = curses.color_pair(1)
+    warn = curses.color_pair(2) | curses.A_BOLD
+
+    sessions = load_sessions(proj_dir)
+    cur, top, msg = 0, 0, ""
+
+    while True:
+        stdscr.erase()
+        h, _ = stdscr.getmaxyx()
+        list_h = max(1, h - 4)
+
+        put(stdscr, 0, "Claude sessions: %s  (%d)" % (proj_path, len(sessions)), curses.A_BOLD)
+        if not sessions:
+            put(stdscr, 2, "No sessions.")
+        cur = min(cur, max(0, len(sessions) - 1))
+        if cur < top:
+            top = cur
+        elif cur >= top + list_h:
+            top = cur - list_h + 1
+
+        for i, s in enumerate(sessions[top:top + list_h]):
+            idx = top + i
+            mark = "*" if s["running"] else " "
+            line = "%s %s  %7s  %s" % (
+                mark, time.strftime("%Y-%m-%d %H:%M", time.localtime(s["mtime"])),
+                human_size(s["size"]), s["title"])
+            attr = curses.A_REVERSE if idx == cur else (dim if s["running"] else 0)
+            put(stdscr, 1 + i, line, attr)
+
+        put(stdscr, h - 2, msg)
+        put(stdscr, h - 1, "up/down move  d delete  c copy  m move  q/Esc quit   * = running", dim)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        msg = ""
+        if key in (ord("q"), 27):
+            return
+        elif key in (curses.KEY_UP, ord("k")):
+            cur = max(0, cur - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            cur = min(len(sessions) - 1, cur + 1)
+        elif key == curses.KEY_PPAGE:
+            cur = max(0, cur - list_h)
+        elif key == curses.KEY_NPAGE:
+            cur = min(len(sessions) - 1, cur + list_h)
+        elif key == ord("d") and sessions:
+            s = sessions[cur]
+            if s["running"]:
+                msg = "This session is running. Close it first."
+            elif confirm_dialog(stdscr, s["title"], warn):
+                try:
+                    delete_session(s)
+                    sessions.pop(cur)
+                    msg = "Moved to Trash: %s" % s["title"]
+                except OSError as e:
+                    msg = "Failed: %s" % e
+            else:
+                msg = "Canceled."
+        elif key in (ord("c"), ord("m")) and sessions:
+            s = sessions[cur]
+            is_move = (key == ord("m"))
+            if is_move and s["running"]:
+                msg = "This session is running. Close it first."
+            else:
+                dest = text_prompt(stdscr, "%s to project path:" % ("Move" if is_move else "Copy"))
+                if dest is None:
+                    msg = "Canceled."
+                else:
+                    try:
+                        copy_or_move_session(s, dest, is_move)
+                        resolved = os.path.realpath(os.path.expanduser(dest))
+                        if is_move:
+                            sessions.pop(cur)
+                            msg = "Moved to %s" % resolved
+                        else:
+                            msg = "Copied to %s" % resolved
+                    except OSError as e:
+                        msg = "Failed: %s" % e
+
+
+def main():
+    proj_path = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()
+    proj_dir = project_dir_for(proj_path)
+    if not os.path.isdir(proj_dir):
+        sys.exit("No Claude sessions for %s\n(looked in %s)" % (proj_path, proj_dir))
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    print("Loading sessions...", flush=True)
+    curses.wrapper(tui, os.path.realpath(os.path.expanduser(proj_path)), proj_dir)
+
+
+if __name__ == "__main__":
+    main()
